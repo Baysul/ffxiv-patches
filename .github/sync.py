@@ -159,15 +159,72 @@ def extend_expansion(path, slug, versions, stamp):
         status, size = head(url)
         if status != 200:
             continue
+        # Provisional: splice() moves it onto the predecessor SE lists.
         prev = doc["latest"]
         patches = insert_after(patches, version, prev, entry(prev, size, url, stamp, "cdn_sweep"))
-        doc["latest"] = version
+        doc["latest"] = max(doc["latest"], version)
         added.append(version)
     if added:
         doc["patches"] = patches
         json.dump(doc, open(path, "w"), indent=2)
         open(path, "a").write("\n")
     return added
+
+THALIAK = "https://thaliak.xiv.dev/graphql/2022-08-14"
+
+def thaliak_versions(slug):
+    """{version: (active, [prerequisites])} from Thaliak, or None when it cannot be asked.
+
+    Thaliak records what the launcher offers to accounts that own every expansion, so it knows
+    the predecessors a trial account's version check hides for ex4/ex5."""
+    query = ('{ repository(slug: "%s") { versions { versionString isActive '
+             'prerequisiteVersions { versionString } } } }' % slug)
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(
+            THALIAK, data=json.dumps({"query": query}).encode(), method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": "ffxiv-patches sync"}),
+            timeout=30)
+        repo = json.loads(r.read())["data"]["repository"]
+    except Exception as e:
+        print(f"::warning::Thaliak unavailable for {slug} ({e}); chain left as appended")
+        return None
+    if not repo:
+        return None
+    return {v["versionString"]: (v["isActive"], [p["versionString"] for p in v["prerequisiteVersions"]])
+            for v in repo["versions"]}
+
+def splice(path, slug):
+    """Re-parents the chain from latest onto the predecessors SE actually offers.
+
+    SE reissues cumulative patches (x.0001) onto an older base and pulls the old ones, so a
+    version confirmed on the CDN does not follow whatever the index called latest. Each link
+    whose predecessor Thaliak does not list is moved to the listed predecessor that is still
+    offered and present in the index. Returns the versions that were re-parented."""
+    known = thaliak_versions(slug)
+    if known is None:
+        return []
+    doc = json.load(open(path), object_pairs_hook=OrderedDict)
+    patches, cur, seen, moved = doc["patches"], doc["latest"], set(), []
+    while cur and cur in patches and cur not in seen:
+        seen.add(cur)
+        prev = patches[cur].get("prev")
+        # Only incremental (D) links are spliced: a root has no predecessor to fix, and an H
+        # patch's Thaliak prerequisites are every version folded into it, not a predecessor.
+        if prev is None or cur.startswith("H"):
+            break
+        listed = [p for p in known.get(cur, (None, []))[1] if p.startswith("H") or p < cur]
+        if listed and prev not in listed:
+            offered = [p for p in listed if p in patches and known.get(p, (False,))[0]]
+            choice = offered[0] if offered else next((p for p in listed if p in patches), None)
+            if choice and choice != prev:
+                patches[cur]["prev"] = choice
+                moved.append(f"{cur} <- {choice} (was {prev})")
+                prev = choice
+        cur = prev
+    if moved:
+        json.dump(doc, open(path, "w"), indent=2)
+        open(path, "a").write("\n")
+    return moved
 
 def dead_on_chain(path):
     doc = json.load(open(path))
@@ -249,6 +306,8 @@ def main():
         caught = catch_up_expansions(args.path, game, stamp)
         for slug, versions in caught.items():
             print(f"  {slug}: +{len(versions)} confirmed on the CDN {versions}")
+            for line in splice(os.path.join(args.path, "repos", f"{slug}.json"), slug):
+                print(f"  {slug}: spliced {line}")
         return 0
 
     # Something moved, so rebuild the whole route from SE's own ordering.
@@ -274,9 +333,11 @@ def main():
     for slug in EXPANSION_PATH:
         repo = os.path.join(args.path, "repos", f"{slug}.json")
         if os.path.exists(repo):
-            added = extend_expansion(repo, slug, new, stamp)
+            added = extend_expansion(repo, slug, sorted(new), stamp)
             if added:
                 print(f"  {slug}: +{len(added)} confirmed on the CDN {added}")
+            for line in splice(repo, slug):
+                print(f"  {slug}: spliced {line}")
 
     for slug in list(by_slug) + list(EXPANSION_PATH):
         repo = os.path.join(args.path, "repos", f"{slug}.json")
